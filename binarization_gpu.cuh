@@ -84,12 +84,12 @@ namespace imgproc
 		__shared__ unsigned char smem[IMGPROC_TILE_W + 2*R];
 		int x = blockIdx.x * IMGPROC_TILE_W;
 		int y = blockIdx.y;
-		unsigned int bindex = threadIdx.x + R;
+		int bindex = threadIdx.x + R;
 
 		for (int i = threadIdx.x; i < IMGPROC_TILE_W + 2*R; i += IMGPROC_TILE_W)
 		{
 			int ind = clamp(x + i - R, 0, w-1);
-			smem[i] = grey[ind];
+			smem[i] = grey[y*w + ind];
 		}
 		x += threadIdx.x;
 		if (x >= w)
@@ -109,12 +109,12 @@ namespace imgproc
 		__shared__ float smem[IMGPROC_TILE_H + 2*R];
 		int x = blockIdx.x;
 		int y = blockIdx.y * IMGPROC_TILE_H;
-		unsigned int bindex = threadIdx.y + R;
+		int bindex = threadIdx.y + R;
 
 		for (int i = threadIdx.y; i < IMGPROC_TILE_H + 2*R; i += IMGPROC_TILE_H)
 		{
 			int ind = clamp(y + i - R, 0, h-1);
-			smem[i] = grey[ind];
+			smem[i] = grey[ind*w + x];
 		}
 		y += threadIdx.y;
 		if (y >= h)
