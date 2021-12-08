@@ -12,8 +12,12 @@ This program uses the STB library for image loading and writing.
 ## Compilation
 
   `nvcc main.cu -o ltbin -O3 -std=c++11 -arch=sm_<xy>`
+
 `<xy>` is the compute capability of the GPU (usually given in the form x.y),
 for example `sm_21` corresponds to a compute capability of 2.1.
 
-It's also possible to compile the code in non-CUDA-capable systems, for which the GPU-acceleration will not be available, by changing the extension of `main.cu` to `main.cpp`. Compilation with GCC:
+It's also possible to compile the code in non-CUDA-capable systems, for which the GPU-acceleration will not be available, by changing the extension of `main.cu` to `main.cpp`. 
+
+Compilation with GCC:
+
   `g++ -std=c++11 -O3 -Wall main.cpp -o ltbincpu`
