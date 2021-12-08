@@ -7,7 +7,7 @@ This repository contains a C++/CUDA implementation of some local thresholding al
 - Bernsen's thresholding (J. Bernsen, *Dynamic thresholding of gray-level images*, Proc. 8th Int. Conf. on Pattern Recognition, Paris, 1986)
 - Chan's algorithm for memory-efficient implementation of previous thresholding techniques in CPU code (C. Chan, *Memory-efficient and fast implementation of local adaptive binarization methods*, School of Mathematics, Sun Yat-Sen University, China, 2019)
 
-The program use the STB library for image loading and writing.
+This program uses the STB library for image loading and writing.
 
 ## Compilation
 
