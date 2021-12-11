@@ -30,16 +30,18 @@ namespace imgproc
 	enum mdk_threshold {mdk_niblack, mdk_sauvola};
 
 	template <mdk_threshold T>
-	IMGPROC_DEVICE_HOST float choose_threshold(float m, float d, float K)
+	IMGPROC_DEVICE_HOST bool choose_threshold(float I, float m, float d, float K)
 	{
 		switch (T)
 		{
 			case mdk_niblack:
-				return niblack_threshold(m, d, K);
+				return niblack_threshold(I, m, d, K);
 			case mdk_sauvola:
-				return sauvola_threshold(m, d, K);
+				return sauvola_threshold(I, m, d, K);
 		}
 	}
+
+	// CONVERSION FUNCTIONS
 
 	__global__ static void rgb2float_krnl(float *f_grey, const unsigned int *b_rgb, unsigned int n)
 	{
@@ -77,6 +79,24 @@ namespace imgproc
 			b_grey[idx] = f_grey[idx] * 255.f;
 		}
 	}
+
+	inline void rgb2float_gpu(float *f_grey, const unsigned int *b_rgb, unsigned int n)
+	{
+		int nBlocks = (n + IMGPROC_BLOCK_SIZE - 1) / IMGPROC_BLOCK_SIZE;
+		rgb2float_krnl <<< nBlocks, IMGPROC_BLOCK_SIZE >>> (f_grey, b_rgb, n);
+	}
+	inline void byte2float_gpu(float *f_grey, const unsigned char *b_grey, unsigned int n)
+	{
+		int nBlocks = (n + IMGPROC_BLOCK_SIZE - 1) / IMGPROC_BLOCK_SIZE;
+		byte2float_krnl <<< nBlocks, IMGPROC_BLOCK_SIZE >>> (f_grey, b_grey, n);
+	}
+	inline void float2byte_gpu(unsigned char *b_grey, const float *f_grey, unsigned int n)
+	{
+		int nBlocks = (n + IMGPROC_BLOCK_SIZE - 1) / IMGPROC_BLOCK_SIZE;
+		float2byte_krnl <<< nBlocks, IMGPROC_BLOCK_SIZE >>> (b_grey, f_grey, n);
+	}
+
+	// SEPARABLE FILTERS
 
 	template <int R>
 	__global__ void hor_mean_filter_krnl(float *mean, const unsigned char *grey, int w)
@@ -128,6 +148,182 @@ namespace imgproc
 		mean[y*w + x] = min(sum / (R*2+1), 1.f);
 	}
 
+	template <int R>
+	__global__ void hor_mean_msq_filter_krnl(float *mean, float *msq, const unsigned char *grey, int w)
+	{
+		__shared__ unsigned char smem[IMGPROC_TILE_W + 2*R];
+		int x = blockIdx.x * IMGPROC_TILE_W;
+		int y = blockIdx.y;
+		int bindex = threadIdx.x + R;
+
+		for (int i = threadIdx.x; i < IMGPROC_TILE_W + 2*R; i += IMGPROC_TILE_W)
+		{
+			int ind = clamp(x + i - R, 0, w-1);
+			smem[i] = grey[y*w + ind];
+		}
+		x += threadIdx.x;
+		if (x >= w)
+			return;
+		__syncthreads();
+
+		int sum = 0, sq = 0, g;
+#pragma unroll
+		for (int dx = -R; dx <= R; ++dx)
+		{
+			g = smem[bindex + dx];
+			sum += g;
+			sq += g*g;
+		}
+		const float den = (R*2+1)*255.f;
+		mean[y*w + x] = min(sum / den, 1.f);
+		msq[y*w + x] = min(sq / (den*255), 1.f);
+	}
+
+	template <int R>
+	__global__ void vert_mean_msq_filter_krnl(float *__restrict__ mean, float *__restrict__ msq,
+											  const float *__restrict__ mean_in, const float *__restrict__ msq_in, int w, int h)
+	{
+		__shared__ float smem[2][IMGPROC_TILE_H + 2*R];
+		int x = blockIdx.x;
+		int y = blockIdx.y * IMGPROC_TILE_H;
+		int bindex = threadIdx.y + R;
+
+		for (int i = threadIdx.y; i < IMGPROC_TILE_H + 2*R; i += IMGPROC_TILE_H)
+		{
+			int ind = clamp(y + i - R, 0, h-1);
+			smem[0][i] = mean_in[ind*w + x];
+		}
+		for (int i = threadIdx.y; i < IMGPROC_TILE_H + 2*R; i += IMGPROC_TILE_H)
+		{
+			int ind = clamp(y + i - R, 0, h-1);
+			smem[1][i] = msq_in[ind*w + x];
+		}
+		y += threadIdx.y;
+		if (y >= h)
+			return;
+		__syncthreads();
+
+		float sum = 0;
+#pragma unroll
+		for (int dy = -R; dy <= R; ++dy)
+			sum += smem[0][bindex + dy];
+		mean[y*w + x] = min(sum / (R*2+1), 1.f);
+
+		sum = 0;
+#pragma unroll
+		for (int dy = -R; dy <= R; ++dy)
+			sum += smem[1][bindex + dy];
+		msq[y*w + x] = min(sum / (R*2+1), 1.f);
+	}
+
+	template <int R>
+	__global__ void hor_min_max_filter_krnl(unsigned char *__restrict__ ming, unsigned char *__restrict__ maxg,
+											const unsigned char *__restrict__ grey, int w)
+	{
+		__shared__ unsigned char smem[IMGPROC_TILE_W + 2*R];
+		int x = blockIdx.x * IMGPROC_TILE_W;
+		int y = blockIdx.y;
+		int bindex = threadIdx.x + R;
+
+		for (int i = threadIdx.x; i < IMGPROC_TILE_W + 2*R; i += IMGPROC_TILE_W)
+		{
+			int ind = clamp(x + i - R, 0, w-1);
+			smem[i] = grey[y*w + ind];
+		}
+		x += threadIdx.x;
+		if (x >= w)
+			return;
+		__syncthreads();
+
+		int cmin = 255, cmax = 0, g;
+#pragma unroll
+		for (int dx = -R; dx <= R; ++dx)
+		{
+			g = smem[bindex + dx];
+			cmin = min(cmin, g);
+			cmax = max(cmax, g);
+		}
+		ming[y*w + x] = cmin;
+		maxg[y*w + x] = cmax;
+	}
+
+	template <int R>
+	__global__ void vert_min_max_filter_krnl(unsigned char *__restrict__ ming, unsigned char *__restrict__ maxg,
+											 const unsigned char *__restrict__ ming_in, const unsigned char *__restrict__ maxg_in, int w, int h)
+	{
+		__shared__ unsigned char smem[2][IMGPROC_TILE_H + 2*R];
+		int x = blockIdx.x;
+		int y = blockIdx.y * IMGPROC_TILE_H;
+		int bindex = threadIdx.y + R;
+
+		for (int i = threadIdx.y; i < IMGPROC_TILE_H + 2*R; i += IMGPROC_TILE_H)
+		{
+			int ind = clamp(y + i - R, 0, h-1);
+			smem[0][i] = ming_in[ind*w + x];
+		}
+		for (int i = threadIdx.y; i < IMGPROC_TILE_H + 2*R; i += IMGPROC_TILE_H)
+		{
+			int ind = clamp(y + i - R, 0, h-1);
+			smem[1][i] = maxg_in[ind*w + x];
+		}
+		y += threadIdx.y;
+		if (y >= h)
+			return;
+		__syncthreads();
+
+		unsigned char c = 255;
+#pragma unroll
+		for (int dy = -R; dy <= R; ++dy)
+			c = min(c, smem[0][bindex + dy]);
+		ming[y*w + x] = c;
+
+		c = 0;
+#pragma unroll
+		for (int dy = -R; dy <= R; ++dy)
+			c = max(c, smem[1][bindex + dy]);
+		maxg[y*w + x] = c;
+	}
+
+	template <int R>
+	void hor_mean_filter_gpu(float *mean, const unsigned char *grey, unsigned int w, unsigned int h)
+	{
+		int nBlocksW = (w + IMGPROC_TILE_W - 1) / IMGPROC_TILE_W;
+		hor_mean_filter_krnl<R> <<< dim3(nBlocksW, h), dim3(IMGPROC_TILE_W, 1) >>> (mean, grey, w);
+	}
+	template <int R>
+	void vert_mean_filter_gpu(float *mean, const float *grey, unsigned int w, unsigned int h)
+	{
+		int nBlocksH = (h + IMGPROC_TILE_H - 1) / IMGPROC_TILE_H;
+		vert_mean_filter_krnl<R> <<< dim3(w, nBlocksH), dim3(1, IMGPROC_TILE_H) >>> (mean, grey, w, h);
+	}
+	template <int R>
+	void hor_mean_msq_filter_gpu(float *mean, float *msq, const unsigned char *grey, unsigned int w, unsigned int h)
+	{
+		int nBlocksW = (w + IMGPROC_TILE_W - 1) / IMGPROC_TILE_W;
+		hor_mean_msq_filter_krnl<R> <<< dim3(nBlocksW, h), dim3(IMGPROC_TILE_W, 1) >>> (mean, msq, grey, w);
+	}
+	template <int R>
+	void vert_mean_msq_filter_gpu(float *mean, float *msq, const float *mean_in, const float *msq_in, unsigned int w, unsigned int h)
+	{
+		int nBlocksH = (h + IMGPROC_TILE_H - 1) / IMGPROC_TILE_H;
+		vert_mean_msq_filter_krnl<R> <<< dim3(w, nBlocksH), dim3(1, IMGPROC_TILE_H) >>> (mean, msq, mean_in, msq_in, w, h);
+	}
+	template <int R>
+	void hor_min_max_filter_gpu(unsigned char *ming, unsigned char *maxg, const unsigned char *grey, unsigned int w, unsigned int h)
+	{
+		int nBlocksW = (w + IMGPROC_TILE_W - 1) / IMGPROC_TILE_W;
+		hor_min_max_filter_krnl<R> <<< dim3(nBlocksW, h), dim3(IMGPROC_TILE_W, 1) >>> (ming, maxg, grey, w);
+	}
+	template <int R>
+	void vert_min_max_filter_gpu(unsigned char *ming, unsigned char *maxg, const unsigned char *ming_in, const unsigned char *maxg_in,
+								 unsigned int w, unsigned int h)
+	{
+		int nBlocksH = (h + IMGPROC_TILE_H - 1) / IMGPROC_TILE_H;
+		vert_min_max_filter_krnl<R> <<< dim3(w, nBlocksH), dim3(1, IMGPROC_TILE_H) >>> (ming, maxg, ming_in, maxg_in, w, h);
+	}
+
+	// THRESHOLDING METHODS
+
 	__global__ static void singh_binarize_krnl(unsigned char *grey, const float *mean, unsigned int n, float K)
 	{
 		unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -138,28 +334,12 @@ namespace imgproc
 			float m = mean[idx];
 			float dev = I - m;
 			float threshold = m * (1 + K * ( dev / (1 - dev + IMGPROC_EPS) - 1));
-			grey[idx] = (I <= threshold) ? 0 : 255;
-		}
-	}
-
-	__global__ static void singh_binarize_krnl2(unsigned char *grey, const long long *integ, int w, int h, int R, float K)
-	{
-		unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-		if (idx < w*h)
-		{
-			int i = idx / w, j = idx % w;
-			float I = grey[idx]/255.f;
-			float den = (2*R+1)*(2*R+1)*255;
-			float m = min(take_local_var(integ, j, i, w, R)/den, 1.f);
-			float dev = I - m;
-			float threshold = m * (1 + K * ( dev / (1 - dev + IMGPROC_EPS) - 1));
-			grey[idx] = (I <= threshold) ? 0 : 255;
+			grey[idx] = (I < threshold) ? 0 : 255;
 		}
 	}
 
 	template <int R, int TILE = IMGPROC_BLOCK_SIZE_2D + 2*R>
-	__global__ void singh_binarize_krnl3(unsigned char *bin, const unsigned char *grey, int w, int h, float K)
+	__global__ void singh_binarize_krnl2(unsigned char *bin, const unsigned char *grey, int w, int h, float K)
 	{
 		__shared__ unsigned char smem[TILE*TILE];
 		int x = blockIdx.x * blockDim.x;
@@ -186,11 +366,41 @@ namespace imgproc
 		float m = sum / den;
 		float dev = I - m;
 		float threshold = m * (1 + K * ( dev / (1 - dev + IMGPROC_EPS) - 1));
-		bin[y*w + x] = (I <= threshold) ? 0 : 255;
+		bin[y*w + x] = (I < threshold) ? 0 : 255;
+	}
+
+	__global__ static void singh_binarize_krnl3(unsigned char *grey, const long long *integ, int w, int h, int R, float K)
+	{
+		unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+		if (idx < w*h)
+		{
+			int i = idx / w, j = idx % w;
+			float I = grey[idx]/255.f;
+			float den = (2*R+1)*(2*R+1)*255;
+			float m = min(take_local_var(integ, j, i, w, R)/den, 1.f);
+			float dev = I - m;
+			float threshold = m * (1 + K * ( dev / (1 - dev + IMGPROC_EPS) - 1));
+			grey[idx] = (I < threshold) ? 0 : 255;
+		}
+	}
+
+	template <mdk_threshold T>
+	__global__ void mdk_binarize_krnl(unsigned char *grey, const float *mean, const float *msq, unsigned int n, float K)
+	{
+		unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+		if (idx < n)
+		{
+			float I = grey[idx]/255.f;
+			float m = mean[idx];
+			float d2 = min(msq[idx] - m*m, 0.25f);
+			grey[idx] = choose_threshold<T>(I, m, d2, K) ? 0 : 255;
+		}
 	}
 
 	template <int R, mdk_threshold T, int TILE = IMGPROC_BLOCK_SIZE_2D + 2*R>
-	__global__ void mdk_binarize_krnl(unsigned char *bin, const unsigned char *grey, int w, int h, float K)
+	__global__ void mdk_binarize_krnl2(unsigned char *bin, const unsigned char *grey, int w, int h, float K)
 	{
 		__shared__ unsigned char smem[TILE*TILE];
 		int x = blockIdx.x * blockDim.x;
@@ -220,13 +430,29 @@ namespace imgproc
 		float den = (2*R+1)*(2*R+1)*255.f;
 		float den2 = den*255;
 		float m = sum / den;
-		float d = min(sqrtf(sq/den2 - m*m), .5f);
-		float threshold = choose_threshold<T>(m, d, K);
-		bin[y*w + x] = (I <= threshold) ? 0 : 255;
+		float d2 = min(sq/den2 - m*m, 0.25f);
+		bin[y*w + x] = choose_threshold<T>(I, m, d2, K) ? 0 : 255;
+	}
+
+	__global__ static void bernsen_binarize_krnl(unsigned char *grey, const unsigned char *ming, const unsigned char *maxg,
+												 unsigned int n, unsigned char L, unsigned char T)
+	{
+		unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+		if (idx < n)
+		{
+			int I = grey[idx];
+			int mini = ming[idx], maxi = maxg[idx];
+			int mid = (maxi + mini)/2;
+			if (maxi - mini < L)
+				grey[idx] = (mid < T) ? 0 : 255;
+			else
+				grey[idx] = (I < mid) ? 0 : 255;
+		}
 	}
 
 	template <int R, int TILE = IMGPROC_BLOCK_SIZE_2D + 2*R>
-	__global__ void bernsen_binarize_krnl(unsigned char *bin, const unsigned char *grey, int w, int h, unsigned char L, unsigned char T)
+	__global__ void bernsen_binarize_krnl2(unsigned char *bin, const unsigned char *grey, int w, int h, unsigned char L, unsigned char T)
 	{
 		__shared__ unsigned char smem[TILE*TILE];
 		int x = blockIdx.x * blockDim.x;
@@ -255,9 +481,9 @@ namespace imgproc
 		int I = smem[bindex];
 		int mid = (maxg + ming)/2;
 		if (maxg - ming < L)
-			bin[y*w + x] = (mid <= T) ? 0 : 255;
+			bin[y*w + x] = (mid < T) ? 0 : 255;
 		else
-			bin[y*w + x] = (I <= mid) ? 0 : 255;
+			bin[y*w + x] = (I < mid) ? 0 : 255;
 	}
 
 	__global__ static void global_binarize_krnl(unsigned char *grey, unsigned int n, unsigned char threshold)
@@ -266,67 +492,52 @@ namespace imgproc
 
 		if (idx < n)
 		{
-			grey[idx] = (grey[idx] <= threshold) ? 0 : 255;
+			grey[idx] = (grey[idx] < threshold) ? 0 : 255;
 		}
 	}
 
-	inline void rgb2float_gpu(float *f_grey, const unsigned int *b_rgb, unsigned int n)
-	{
-		int nBlocks = (n + IMGPROC_BLOCK_SIZE - 1) / IMGPROC_BLOCK_SIZE;
-		rgb2float_krnl <<< nBlocks, IMGPROC_BLOCK_SIZE >>> (f_grey, b_rgb, n);
-	}
-	inline void byte2float_gpu(float *f_grey, const unsigned char *b_grey, unsigned int n)
-	{
-		int nBlocks = (n + IMGPROC_BLOCK_SIZE - 1) / IMGPROC_BLOCK_SIZE;
-		byte2float_krnl <<< nBlocks, IMGPROC_BLOCK_SIZE >>> (f_grey, b_grey, n);
-	}
-	inline void float2byte_gpu(unsigned char *b_grey, const float *f_grey, unsigned int n)
-	{
-		int nBlocks = (n + IMGPROC_BLOCK_SIZE - 1) / IMGPROC_BLOCK_SIZE;
-		float2byte_krnl <<< nBlocks, IMGPROC_BLOCK_SIZE >>> (b_grey, f_grey, n);
-	}
-	template <int R>
-	void hor_mean_filter_gpu(float *mean, const unsigned char *grey, unsigned int w, unsigned int h)
-	{
-		int nBlocksW = (w + IMGPROC_TILE_W - 1) / IMGPROC_TILE_W;
-		hor_mean_filter_krnl<R> <<< dim3(nBlocksW, h), dim3(IMGPROC_TILE_W, 1) >>> (mean, grey, w);
-	}
-	template <int R>
-	void vert_mean_filter_gpu(float *mean, const float *grey, unsigned int w, unsigned int h)
-	{
-		int nBlocksH = (h + IMGPROC_TILE_H - 1) / IMGPROC_TILE_H;
-		vert_mean_filter_krnl<R> <<< dim3(w, nBlocksH), dim3(1, IMGPROC_TILE_H) >>> (mean, grey, w, h);
-	}
 	inline void singh_binarize_gpu(unsigned char *grey, const float *mean, unsigned int n, float K)
 	{
 		int nBlocks = (n + IMGPROC_BLOCK_SIZE - 1) / IMGPROC_BLOCK_SIZE;
 		singh_binarize_krnl <<< nBlocks, IMGPROC_BLOCK_SIZE >>> (grey, mean, n, K);
 	}
-	inline void singh_binarize_gpu2(unsigned char *grey, const long long *integ, int w, int h, int R, float K)
+	template <int R>
+	void singh_binarize_gpu2(unsigned char *bin, const unsigned char *grey, unsigned int w, unsigned int h, float K)
+	{
+		int nBlocksW = (w + IMGPROC_BLOCK_SIZE_2D - 1) / IMGPROC_BLOCK_SIZE_2D;
+		int nBlocksH = (h + IMGPROC_BLOCK_SIZE_2D - 1) / IMGPROC_BLOCK_SIZE_2D;
+		singh_binarize_krnl2<R> <<< dim3(nBlocksW, nBlocksH), dim3(IMGPROC_BLOCK_SIZE_2D, IMGPROC_BLOCK_SIZE_2D) >>> (bin, grey, w, h, K);
+	}
+	inline void singh_binarize_gpu3(unsigned char *grey, const long long *integ, unsigned int w, unsigned int h, int R, float K)
 	{
 		int nBlocks = (w*h + IMGPROC_BLOCK_SIZE - 1) / IMGPROC_BLOCK_SIZE;
-		singh_binarize_krnl2 <<< nBlocks, IMGPROC_BLOCK_SIZE >>> (grey, integ, w, h, R, K);
+		singh_binarize_krnl3 <<< nBlocks, IMGPROC_BLOCK_SIZE >>> (grey, integ, w, h, R, K);
 	}
-	template <int R>
-	void singh_binarize_gpu3(unsigned char *bin, const unsigned char *grey, int w, int h, float K)
+	template <mdk_threshold T>
+	void mdk_binarize_gpu(unsigned char *grey, const float *mean, const float *msq, unsigned int n, float K)
 	{
-		int nBlocksW = (w + IMGPROC_BLOCK_SIZE_2D - 1) / IMGPROC_BLOCK_SIZE_2D;
-		int nBlocksH = (h + IMGPROC_BLOCK_SIZE_2D - 1) / IMGPROC_BLOCK_SIZE_2D;
-		singh_binarize_krnl3<R> <<< dim3(nBlocksW, nBlocksH), dim3(IMGPROC_BLOCK_SIZE_2D, IMGPROC_BLOCK_SIZE_2D) >>> (bin, grey, w, h, K);
+		int nBlocks = (n + IMGPROC_BLOCK_SIZE - 1) / IMGPROC_BLOCK_SIZE;
+		mdk_binarize_krnl<T> <<< nBlocks, IMGPROC_BLOCK_SIZE >>> (grey, mean, msq, n, K);
 	}
 	template <int R, mdk_threshold T>
-	void mdk_binarize_gpu(unsigned char *bin, const unsigned char *grey, int w, int h, float K)
+	void mdk_binarize_gpu2(unsigned char *bin, const unsigned char *grey, int w, int h, float K)
 	{
 		int nBlocksW = (w + IMGPROC_BLOCK_SIZE_2D - 1) / IMGPROC_BLOCK_SIZE_2D;
 		int nBlocksH = (h + IMGPROC_BLOCK_SIZE_2D - 1) / IMGPROC_BLOCK_SIZE_2D;
-		mdk_binarize_krnl<R, T> <<< dim3(nBlocksW, nBlocksH), dim3(IMGPROC_BLOCK_SIZE_2D, IMGPROC_BLOCK_SIZE_2D) >>> (bin, grey, w, h, K);
+		mdk_binarize_krnl2<R, T> <<< dim3(nBlocksW, nBlocksH), dim3(IMGPROC_BLOCK_SIZE_2D, IMGPROC_BLOCK_SIZE_2D) >>> (bin, grey, w, h, K);
+	}
+	inline void bernsen_binarize_gpu(unsigned char *grey, const unsigned char *ming, const unsigned char* maxg,
+									 unsigned int n, unsigned char L, unsigned char T)
+	{
+		int nBlocks = (n + IMGPROC_BLOCK_SIZE - 1) / IMGPROC_BLOCK_SIZE;
+		bernsen_binarize_krnl <<< nBlocks, IMGPROC_BLOCK_SIZE >>> (grey, ming, maxg, n, L, T);
 	}
 	template <int R>
-	void bernsen_binarize_gpu(unsigned char *bin, const unsigned char *grey, int w, int h, unsigned char L, unsigned char T)
+	void bernsen_binarize_gpu2(unsigned char *bin, const unsigned char *grey, int w, int h, unsigned char L, unsigned char T)
 	{
 		int nBlocksW = (w + IMGPROC_BLOCK_SIZE_2D - 1) / IMGPROC_BLOCK_SIZE_2D;
 		int nBlocksH = (h + IMGPROC_BLOCK_SIZE_2D - 1) / IMGPROC_BLOCK_SIZE_2D;
-		bernsen_binarize_krnl<R> <<< dim3(nBlocksW, nBlocksH), dim3(IMGPROC_BLOCK_SIZE_2D, IMGPROC_BLOCK_SIZE_2D) >>> (bin, grey, w, h, L, T);
+		bernsen_binarize_krnl2<R> <<< dim3(nBlocksW, nBlocksH), dim3(IMGPROC_BLOCK_SIZE_2D, IMGPROC_BLOCK_SIZE_2D) >>> (bin, grey, w, h, L, T);
 	}
 	inline void global_binarize_gpu(unsigned char *grey, unsigned int n, unsigned char threshold)
 	{
@@ -354,7 +565,22 @@ namespace imgproc
 		gpuErrchk(cudaMemcpy(raw, d_raw, n, cudaMemcpyDeviceToHost)); // copy data from GPU to CPU
 	}
 
-	extern inline void singh_gpu2(unsigned char *raw, unsigned int w, unsigned int h, int R = 15, float K = 0.06f)
+	template <int R = 15>
+	extern void singh_gpu2(unsigned char *raw, unsigned int w, unsigned int h, float K = 0.06f)
+	{
+		unsigned int n = w * h;
+		auto d_buf = simple_alloc_gpu(2*n*sizeof(unsigned char));
+		unsigned char *d_raw = (unsigned char*)d_buf;
+		unsigned char *d_bin = d_raw + n;
+
+		gpuErrchk(cudaMemcpy(d_raw, raw, n, cudaMemcpyHostToDevice)); // copy data from CPU to GPU
+
+		singh_binarize_gpu2<R>(d_bin, d_raw, w, h, K);
+
+		gpuErrchk(cudaMemcpy(raw, d_bin, n, cudaMemcpyDeviceToHost)); // copy data from GPU to CPU
+	}
+
+	extern inline void singh_gpu3(unsigned char *raw, unsigned int w, unsigned int h, int R = 15, float K = 0.06f)
 	{
 		auto buf = simple_alloc((w + 2*R+1)*(h + 2*R+1)*sizeof(long long));
 		long long *integ = (long long*)buf;
@@ -369,37 +595,43 @@ namespace imgproc
 		gpuErrchk(cudaMemcpy(d_raw, raw, n, cudaMemcpyHostToDevice)); // copy data from CPU to GPU
 		gpuErrchk(cudaMemcpy(d_integ, integ, (w + 2*R+1)*(h + 2*R+1)*sizeof(long long), cudaMemcpyHostToDevice));
 
-		singh_binarize_gpu2(d_raw, d_integ, w, h, R, K);
+		singh_binarize_gpu3(d_raw, d_integ, w, h, R, K);
 
 		gpuErrchk(cudaMemcpy(raw, d_raw, n, cudaMemcpyDeviceToHost)); // copy data from GPU to CPU
-	}
-
-	template <int R = 15>
-	extern void singh_gpu3(unsigned char *raw, unsigned int w, unsigned int h, float K = 0.06f)
-	{
-		unsigned int n = w * h;
-		auto d_buf = simple_alloc_gpu(2*n*sizeof(unsigned char));
-		unsigned char *d_raw = (unsigned char*)d_buf;
-		unsigned char *d_bin = d_raw + n;
-
-		gpuErrchk(cudaMemcpy(d_raw, raw, n, cudaMemcpyHostToDevice)); // copy data from CPU to GPU
-
-		singh_binarize_gpu3<R>(d_bin, d_raw, w, h, K);
-
-		gpuErrchk(cudaMemcpy(raw, d_bin, n, cudaMemcpyDeviceToHost)); // copy data from GPU to CPU
 	}
 
 	template <int R = 15, mdk_threshold T>
 	extern void mdk_gpu(unsigned char *raw, unsigned int w, unsigned int h, float K)
 	{
 		unsigned int n = w * h;
+		// input/output (unsigned char), horizontal mean (float), mean (float), horizontal msq (float), msq (float)
+		auto d_buf = simple_alloc_gpu(n*(4*sizeof(float) + sizeof(unsigned char)));
+		float *d_hor_mean =(float*)d_buf;
+		float *d_mean = d_hor_mean + n;
+		float *d_hor_msq = d_mean + n;
+		float *d_msq = d_hor_msq + n;
+		unsigned char *d_raw = (unsigned char*)(d_msq + n);
+
+		gpuErrchk(cudaMemcpy(d_raw, raw, n, cudaMemcpyHostToDevice)); // copy data from CPU to GPU
+
+		hor_mean_msq_filter_gpu<R>(d_hor_mean, d_hor_msq, d_raw, w, h);
+		vert_mean_msq_filter_gpu<R>(d_mean, d_msq, d_hor_mean, d_hor_msq, w, h);
+
+		mdk_binarize_gpu<T>(d_raw, d_mean, d_msq, n, K);
+
+		gpuErrchk(cudaMemcpy(raw, d_raw, n, cudaMemcpyDeviceToHost)); // copy data from GPU to CPU
+	}
+	template <int R = 15, mdk_threshold T>
+	extern void mdk_gpu2(unsigned char *raw, unsigned int w, unsigned int h, float K)
+	{
+		unsigned int n = w * h;
 		auto d_buf = simple_alloc_gpu(2*n*sizeof(unsigned char));
 		unsigned char *d_raw = (unsigned char*)d_buf;
 		unsigned char *d_bin = d_raw + n;
 
 		gpuErrchk(cudaMemcpy(d_raw, raw, n, cudaMemcpyHostToDevice)); // copy data from CPU to GPU
 
-		mdk_binarize_gpu<R, T>(d_bin, d_raw, w, h, K);
+		mdk_binarize_gpu2<R, T>(d_bin, d_raw, w, h, K);
 
 		gpuErrchk(cudaMemcpy(raw, d_bin, n, cudaMemcpyDeviceToHost)); // copy data from GPU to CPU
 	}
@@ -414,7 +646,38 @@ namespace imgproc
 		mdk_gpu<R, mdk_sauvola>(raw, w, h, K);
 	}
 	template <int R = 15>
+	extern void niblack_gpu2(unsigned char *raw, unsigned int w, unsigned int h, float K = -0.2f)
+	{
+		mdk_gpu2<R, mdk_niblack>(raw, w, h, K);
+	}
+	template <int R = 15>
+	extern void sauvola_gpu2(unsigned char *raw, unsigned int w, unsigned int h, float K = 0.06f)
+	{
+		mdk_gpu2<R, mdk_sauvola>(raw, w, h, K);
+	}
+	template <int R = 15>
 	extern void bernsen_gpu(unsigned char *raw, unsigned int w, unsigned int h, unsigned char L = 25, unsigned char T = 127)
+	{
+		unsigned int n = w * h;
+		// input/output (unsigned char), horizontal min/max (unsigned char*2), min/max (unsigned char*2)
+		auto d_buf = simple_alloc_gpu(n*(5*sizeof(unsigned char)));
+		unsigned char *d_hor_min = (unsigned char*)d_buf;
+		unsigned char *d_hor_max = d_hor_min + n;
+		unsigned char *d_min = d_hor_max + n;
+		unsigned char *d_max = d_min + n;
+		unsigned char *d_raw = (unsigned char*)(d_max + n);
+
+		gpuErrchk(cudaMemcpy(d_raw, raw, n, cudaMemcpyHostToDevice)); // copy data from CPU to GPU
+
+		hor_min_max_filter_gpu<R>(d_hor_min, d_hor_max, d_raw, w, h);
+		vert_min_max_filter_gpu<R>(d_min, d_max, d_hor_min, d_hor_max, w, h);
+
+		bernsen_binarize_gpu(d_raw, d_min, d_max, n, L, T);
+
+		gpuErrchk(cudaMemcpy(raw, d_raw, n, cudaMemcpyDeviceToHost)); // copy data from GPU to CPU
+	}
+	template <int R = 15>
+	extern void bernsen_gpu2(unsigned char *raw, unsigned int w, unsigned int h, unsigned char L = 25, unsigned char T = 127)
 	{
 		unsigned int n = w * h;
 		auto d_buf = simple_alloc_gpu(2*n*sizeof(unsigned char));
@@ -423,7 +686,7 @@ namespace imgproc
 
 		gpuErrchk(cudaMemcpy(d_raw, raw, n, cudaMemcpyHostToDevice)); // copy data from CPU to GPU
 
-		bernsen_binarize_gpu<R>(d_bin, d_raw, w, h, L, T);
+		bernsen_binarize_gpu2<R>(d_bin, d_raw, w, h, L, T);
 
 		gpuErrchk(cudaMemcpy(raw, d_bin, n, cudaMemcpyDeviceToHost)); // copy data from GPU to CPU
 	}
