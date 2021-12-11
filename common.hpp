@@ -75,11 +75,17 @@ namespace imgproc
 		return (x <= (T)0.0031308) ? x * (T)12.92 : max(pow(x * (T)1.055, 1/(T)2.4) - (T)0.055, (T)0);
 	}
 
-	inline unsigned char* simple_alloc(unsigned long long needed_bytes)
+	inline unsigned char* simple_alloc(unsigned long long needed_bytes, bool free = false)
 	// reallocates only when needed
 	{
 		static unsigned char *buf = nullptr;
 		static unsigned long long bytes = 0;
+
+		if (free)
+		{
+			delete[] buf;
+			bytes = 0;
+		}
 
 		if (needed_bytes > bytes)
 		{
@@ -91,11 +97,18 @@ namespace imgproc
 		return buf;
 	}
 
-	inline unsigned char* simple_alloc_gpu(unsigned long long needed_bytes)
+#ifdef __CUDACC__
+	inline unsigned char* simple_alloc_gpu(unsigned long long needed_bytes, bool free = false)
 	// reallocates only when needed
 	{
 		static unsigned char *d_buf = nullptr;
 		static unsigned long long bytes = 0;
+
+		if (free)
+		{
+			gpuErrchk(cudaFree(d_buf));
+			bytes = 0;
+		}
 
 		if (needed_bytes > bytes)
 		{
@@ -106,6 +119,7 @@ namespace imgproc
 
 		return d_buf;
 	}
+#endif
 
 	IMGPROC_DEVICE_HOST inline unsigned int clamp_coord(int x, int y, int w, int h)
 	{
@@ -168,13 +182,16 @@ namespace imgproc
 											   + integ[integ_coord(j, i-1, w, R)] + integ[integ_coord(j-1, i, w, R)] - integ[integ_coord(j-1, i-1, w, R)];
 	}
 
-	IMGPROC_DEVICE_HOST inline float niblack_threshold(float m, float d, float K)
+	IMGPROC_DEVICE_HOST inline bool niblack_threshold(float I, float m, float d2, float K)
 	{
-		return m + K * d;
+		float a = I - m;
+		return a < 0 || a*a < K*K*d2;
 	}
-	IMGPROC_DEVICE_HOST inline float sauvola_threshold(float m, float d, float K)
+	IMGPROC_DEVICE_HOST inline bool sauvola_threshold(float I, float m, float d2, float K)
 	{
-		return m * (1 + K * (2*d - 1));
+		float a = I + m*(K - 1);
+		float b = m*K;
+		return a < 0 || a*a < 4*b*b*d2;
 	}
 
 } // namespace imgproc
