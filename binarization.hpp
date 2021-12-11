@@ -36,11 +36,11 @@ namespace imgproc
 				float m = std::min(take_local_var(integ, j, i, w, R)/den, 1.f);
 				float dev = I - m;
 				float threshold = m * (1 + K * ( dev / (1 - dev + IMGPROC_EPS) - 1));
-				grey[i*w + j] = (I <= threshold) ? 0 : 255;
+				grey[i*w + j] = (I < threshold) ? 0 : 255;
 			}
 	}
 	inline void mdk_binarize(unsigned char *grey, const long long *integ, const long long *sq_integ, int w, int h, int R, float K,
-								float (*t)(float m, float d, float K))
+							 bool (*t)(float I, float m, float d, float K))
 	// grey is both the input greyscale image and the output binarized image (inplace algorithm)
 	{
 		float den = (2*R+1)*(2*R+1)*255;
@@ -51,10 +51,57 @@ namespace imgproc
 				float I = grey[i*w + j]/255.f;
 				float m = std::min(take_local_var(integ, j, i, w, R)/den, 1.f);
 				float s = take_local_var(sq_integ, j, i, w, R)/den2;
-				float d = std::min(std::sqrtf(s - m*m), .5f); // maximum std.dev. is 0.5
-				float threshold = t(m, d, K);
-				grey[i*w + j] = (I <= threshold) ? 0 : 255;
+				float d2 = std::min(s - m*m, 0.25f); // maximum std.dev. is 0.5
+				grey[i*w + j] = t(I, m, d2, K) ? 0 : 255;
 			}
+	}
+	inline void hor_min_max_filter(unsigned char *ming, unsigned char *maxg, const unsigned char *grey, int w, int h, int R)
+	{
+		for (int i = 0; i < h; ++i)
+			for(int j = 0; j < w; ++j)
+			{
+				int cmin = 255, cmax = 0, g;
+				for (int dx = -R; dx <= R; ++dx)
+				{
+					g = grey[i*w + clamp(j+dx, 0, w-1)];
+					cmin = std::min(cmin, g);
+					cmax = std::max(cmax, g);
+				}
+				ming[i*w + j] = cmin;
+				maxg[i*w + j] = cmax;
+			}
+	}
+	inline void vert_min_max_filter(unsigned char *ming, unsigned char *maxg, const unsigned char *ming_in, const unsigned char *maxg_in,
+									int w, int h, int R)
+	{
+		for (int i = 0; i < h; ++i)
+			for(int j = 0; j < w; ++j)
+			{
+				unsigned char c = 255;
+				for (int dy = -R; dy <= R; ++dy)
+					c = std::min(c, ming_in[clamp(i+dy, 0, h-1)*w + j]);
+				ming[i*w + j] = c;
+			}
+		for (int i = 0; i < h; ++i)
+			for(int j = 0; j < w; ++j)
+			{
+				unsigned char c = 0;
+				for (int dy = -R; dy <= R; ++dy)
+					c = std::max(c, maxg_in[clamp(i+dy, 0, h-1)*w + j]);
+				maxg[i*w + j] = c;
+			}
+	}
+	inline void bernsen_binarize(unsigned char *grey, const unsigned char *ming, const unsigned char *maxg, int n, unsigned char L, unsigned char T)
+	{
+		for (int idx = 0; idx < n; ++idx)
+		{
+			int I = grey[idx];
+			int mid = (maxg[idx] + ming[idx])/2;
+			if (maxg[idx] - ming[idx] < L)
+				grey[idx] = (mid < T) ? 0 : 255;
+			else
+				grey[idx] = (I < mid) ? 0 : 255;
+		}
 	}
 
 	inline void singh(unsigned char *raw, unsigned int w, unsigned int h, int R = 15, float K = 0.06f)
@@ -66,7 +113,7 @@ namespace imgproc
 
 		singh_binarize(raw, integ, w, h, R, K);
 	}
-	inline void mdk(unsigned char *raw, unsigned int w, unsigned int h, int R, float K, float (*t)(float m, float d, float K))
+	inline void mdk(unsigned char *raw, unsigned int w, unsigned int h, int R, float K, bool (*t)(float I, float m, float d, float K))
 	{
 		auto buf = simple_alloc(2*(w + 2*R+1)*(h + 2*R+1)*sizeof(long long));
 		long long *integ = (long long*)buf;
@@ -84,6 +131,20 @@ namespace imgproc
 	inline void sauvola(unsigned char *raw, unsigned int w, unsigned int h, int R = 15, float K = 0.06f)
 	{
 		mdk(raw, w, h, R, K, sauvola_threshold);
+	}
+	inline void bernsen(unsigned char *raw, unsigned int w, unsigned int h, int R = 15, unsigned char L = 15, unsigned char T = 127)
+	{
+		unsigned int n = w*h;
+		auto buf = simple_alloc(4*n*sizeof(unsigned char));
+		unsigned char *hor_min = (unsigned char*)buf;
+		unsigned char *hor_max = hor_min + n;
+		unsigned char *ming = hor_max + n;
+		unsigned char *maxg = ming + n;
+
+		hor_min_max_filter(hor_min, hor_max, raw, w, h, R);
+		vert_min_max_filter(ming, maxg, hor_min, hor_max, w, h, R);
+
+		bernsen_binarize(raw, ming, maxg, n, L, T);
 	}
 
 	// CHAN algorithm
@@ -125,12 +186,12 @@ namespace imgproc
 				float m = c/(n*255);
 				float dev = I - m;
 				float threshold = m * (1 + K * ( dev / (1 - dev + IMGPROC_EPS) - 1));
-				raw[i*w + j] = (I <= threshold) ? 0 : 255;
+				raw[i*w + j] = (I < threshold) ? 0 : 255;
 			}
 		}
 	}
 
-	inline void mdk_chan(unsigned char *raw, int w, int h, int R, float K, float (*t)(float m, float d, float K))
+	inline void mdk_chan(unsigned char *raw, int w, int h, int R, float K, bool (*t)(float I, float m, float d, float K))
 	{
 		auto buf = simple_alloc(2*w*sizeof(int) + w*h*sizeof(unsigned char));
 		int *C = (int*)buf;
@@ -175,9 +236,8 @@ namespace imgproc
 				float I = grey[i*w + j]/255.f;
 				float n = (std::min(j+R, w-1) - std::max(j-R-1, -1))*(std::min(i+R, h-1) - std::max(i-R-1, -1));
 				float m = c/(n*255);
-				float d = std::sqrtf(s/(255*255*n) - m*m);
-				float threshold = t(m, d, K);
-				raw[i*w + j] = (I <= threshold) ? 0 : 255;
+				float d2 = std::min(s/(255*255*n) - m*m, 0.25f);
+				raw[i*w + j] = t(I, m, d2, K) ? 0 : 255;
 			}
 		}
 	}
@@ -196,7 +256,7 @@ namespace imgproc
 	{
 		unsigned int n = w*h;
 		for (unsigned int i = 0; i < n; ++i)
-			raw[i] = (raw[i] <= threshold) ? 0 : 255;
+			raw[i] = (raw[i] < threshold) ? 0 : 255;
 	}
 
 } // namespace imgproc
