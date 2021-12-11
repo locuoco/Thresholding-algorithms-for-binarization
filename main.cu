@@ -32,8 +32,8 @@
 
 #ifdef __CUDACC__
 
-#define ENABLE_CUDA_GPGPU // comment this line to use C++ code when compiling with CUDA compiler
-						  // not needed if you are using GCC
+//#define ENABLE_CUDA_GPGPU	// comment this line to use C++ code when compiling with CUDA compiler
+							// not needed if you are using GCC
 #endif
 
 #include "binarization.hpp"
@@ -53,21 +53,40 @@
 #include <string>
 #include <chrono>
 
-#define W 31		// window size (must be odd)
+#define W 13		// window size (must be odd)
 #define R (W/2)		// filter radius
 
 #if W % 2 == 0
 #error Value of W: NO BUONO!
 #endif
 
-int main(const int narg, const char** args)
+void test(unsigned char* raw, unsigned int w, unsigned int h)
 {
 #ifdef ENABLE_CUDA_GPGPU
-	gpuErrchk(cudaFree(nullptr)); // force to create the CUDA context
-	std::cout << "CUDA enabled!" << std::endl;
+	imgproc::bernsen_gpu2<R>(raw, w, h);
 #else
-	std::cout << "CUDA NOT enabled!" << std::endl;
+	imgproc::bernsen(raw, w, h, R);
 #endif
+}
+
+int main(const int narg, const char** args)
+{
+	namespace chrono = std::chrono;
+
+	auto begin = chrono::steady_clock::now();
+
+#ifdef ENABLE_CUDA_GPGPU
+	gpuErrchk(cudaFree(nullptr)); // force to create the CUDA context
+	std::cout << "CUDA enabled!\n";
+#else
+	std::cout << "CUDA NOT enabled!\n";
+#endif
+
+	auto end = chrono::steady_clock::now();
+
+	std::cout << "Time elapsed for creating CUDA context: "
+				  << chrono::duration_cast<chrono::microseconds>(end - begin).count() * 1.e-6
+				  << " [s]\n";
 
 	std::string *img_paths;
 	unsigned int Nimages;
@@ -84,11 +103,12 @@ int main(const int narg, const char** args)
 			img_paths[i-1] = std::string(args[i]);
 	}
 
-	namespace chrono = std::chrono;
-
 	for (int i = 0; i < Nimages; ++i)
 	{
 		int width, height, ch;
+
+		begin = chrono::steady_clock::now();
+
 		unsigned char *raw = stbi_load(img_paths[i].c_str(), &width, &height, &ch, 1);
 
 		if (!raw)
@@ -97,19 +117,31 @@ int main(const int narg, const char** args)
 			continue;
 		}
 
-		auto begin = chrono::steady_clock::now();
+		end = chrono::steady_clock::now();
 
-#ifdef ENABLE_CUDA_GPGPU
-		imgproc::singh_gpu(raw, width, height);
-#else
-		imgproc::global(raw, width, height);
-#endif
-
-		auto end = chrono::steady_clock::now();
-
-		std::cout << "Time elapsed for image " << i << ": "
+		std::cout << "Time elapsed for loading image " << i << ": "
 				  << chrono::duration_cast<chrono::microseconds>(end - begin).count() * 1.e-6
-				  << " [s]" << std::endl;
+				  << " [s]\n";
+
+		begin = chrono::steady_clock::now();
+
+		test(raw, width, height);
+
+		end = chrono::steady_clock::now();
+
+		std::cout << "Time elapsed for processing image " << i << ": "
+				  << chrono::duration_cast<chrono::microseconds>(end - begin).count() * 1.e-6
+				  << " [s]\n";
+
+		begin = chrono::steady_clock::now();
+
+		test(raw, width, height);
+
+		end = chrono::steady_clock::now();
+
+		std::cout << "Time elapsed for processing image with preallocation " << i << ": "
+				  << chrono::duration_cast<chrono::microseconds>(end - begin).count() * 1.e-6
+				  << " [s]\n";
 
 		std::string out_path("image");
 		out_path += std::to_string(i);
