@@ -322,7 +322,7 @@ namespace imgproc
 		vert_min_max_filter_krnl<R> <<< dim3(w, nBlocksH), dim3(1, IMGPROC_TILE_H) >>> (ming, maxg, ming_in, maxg_in, w, h);
 	}
 
-	// THRESHOLDING METHODS
+	// BINARIZATION
 
 	__global__ static void singh_binarize_krnl(unsigned char *grey, const float *mean, unsigned int n, float K)
 	{
@@ -394,7 +394,7 @@ namespace imgproc
 		{
 			float I = grey[idx]/255.f;
 			float m = mean[idx];
-			float d2 = min(msq[idx] - m*m, 0.25f);
+			float d2 = clamp(msq[idx] - m*m, 0.f, 0.25f);
 			grey[idx] = choose_threshold<T>(I, m, d2, K) ? 0 : 255;
 		}
 	}
@@ -430,12 +430,12 @@ namespace imgproc
 		float den = (2*R+1)*(2*R+1)*255.f;
 		float den2 = den*255;
 		float m = sum / den;
-		float d2 = min(sq/den2 - m*m, 0.25f);
+		float d2 = clamp(sq/den2 - m*m, 0.f, 0.25f);
 		bin[y*w + x] = choose_threshold<T>(I, m, d2, K) ? 0 : 255;
 	}
 
 	__global__ static void bernsen_binarize_krnl(unsigned char *grey, const unsigned char *ming, const unsigned char *maxg,
-												 unsigned int n, unsigned char L, unsigned char T)
+												 unsigned int n, int L, int T)
 	{
 		unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -443,16 +443,16 @@ namespace imgproc
 		{
 			int I = grey[idx];
 			int mini = ming[idx], maxi = maxg[idx];
-			int mid = (maxi + mini)/2;
+			int mid = maxi + mini;
 			if (maxi - mini < L)
-				grey[idx] = (mid < T) ? 0 : 255;
+				grey[idx] = (mid < 2*T) ? 0 : 255;
 			else
-				grey[idx] = (I < mid) ? 0 : 255;
+				grey[idx] = (2*I < mid) ? 0 : 255;
 		}
 	}
 
 	template <int R, int TILE = IMGPROC_BLOCK_SIZE_2D + 2*R>
-	__global__ void bernsen_binarize_krnl2(unsigned char *bin, const unsigned char *grey, int w, int h, unsigned char L, unsigned char T)
+	__global__ void bernsen_binarize_krnl2(unsigned char *bin, const unsigned char *grey, int w, int h, int L, int T)
 	{
 		__shared__ unsigned char smem[TILE*TILE];
 		int x = blockIdx.x * blockDim.x;
@@ -479,11 +479,11 @@ namespace imgproc
 				maxg = max(maxg, g);
 			}
 		int I = smem[bindex];
-		int mid = (maxg + ming)/2;
+		int mid = maxg + ming;
 		if (maxg - ming < L)
-			bin[y*w + x] = (mid < T) ? 0 : 255;
+			bin[y*w + x] = (mid < 2*T) ? 0 : 255;
 		else
-			bin[y*w + x] = (I < mid) ? 0 : 255;
+			bin[y*w + x] = (2*I < mid) ? 0 : 255;
 	}
 
 	__global__ static void global_binarize_krnl(unsigned char *grey, unsigned int n, unsigned char threshold)
@@ -544,6 +544,8 @@ namespace imgproc
 		int nBlocks = (n + IMGPROC_BLOCK_SIZE - 1) / IMGPROC_BLOCK_SIZE;
 		global_binarize_krnl <<< nBlocks, IMGPROC_BLOCK_SIZE >>> (grey, n, threshold);
 	}
+
+	// THRESHOLDING FUNCTIONS
 
 	template <int R = 15>
 	extern void singh_gpu(unsigned char *raw, unsigned int w, unsigned int h, float K = 0.06f)
@@ -656,7 +658,7 @@ namespace imgproc
 		mdk_gpu2<R, mdk_sauvola>(raw, w, h, K);
 	}
 	template <int R = 15>
-	extern void bernsen_gpu(unsigned char *raw, unsigned int w, unsigned int h, unsigned char L = 25, unsigned char T = 127)
+	extern void bernsen_gpu(unsigned char *raw, unsigned int w, unsigned int h, unsigned char L = 15, unsigned char T = 127)
 	{
 		unsigned int n = w * h;
 		// input/output (unsigned char), horizontal min/max (unsigned char*2), min/max (unsigned char*2)
@@ -665,7 +667,7 @@ namespace imgproc
 		unsigned char *d_hor_max = d_hor_min + n;
 		unsigned char *d_min = d_hor_max + n;
 		unsigned char *d_max = d_min + n;
-		unsigned char *d_raw = (unsigned char*)(d_max + n);
+		unsigned char *d_raw = d_max + n;
 
 		gpuErrchk(cudaMemcpy(d_raw, raw, n, cudaMemcpyHostToDevice)); // copy data from CPU to GPU
 
@@ -677,7 +679,7 @@ namespace imgproc
 		gpuErrchk(cudaMemcpy(raw, d_raw, n, cudaMemcpyDeviceToHost)); // copy data from GPU to CPU
 	}
 	template <int R = 15>
-	extern void bernsen_gpu2(unsigned char *raw, unsigned int w, unsigned int h, unsigned char L = 25, unsigned char T = 127)
+	extern void bernsen_gpu2(unsigned char *raw, unsigned int w, unsigned int h, unsigned char L = 15, unsigned char T = 127)
 	{
 		unsigned int n = w * h;
 		auto d_buf = simple_alloc_gpu(2*n*sizeof(unsigned char));
