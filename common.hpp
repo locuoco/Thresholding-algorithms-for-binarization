@@ -52,7 +52,12 @@ namespace imgproc
 	template <typename T>
 	IMGPROC_DEVICE_HOST T clamp(T x, T a, T b)
 	{
-		return (x < a) ? a : (x > b) ? b : x;
+#ifndef __CUDA_ARCH__
+		using std::max;
+		using std::min;
+#endif
+		return min(max(a, x), b);
+		//return (x < a) ? a : (x > b) ? b : x;
 	}
 
 	template <typename T>
@@ -75,15 +80,16 @@ namespace imgproc
 		return (x <= (T)0.0031308) ? x * (T)12.92 : max(pow(x * (T)1.055, 1/(T)2.4) - (T)0.055, (T)0);
 	}
 
-	inline unsigned char* simple_alloc(unsigned long long needed_bytes, bool free = false)
+	inline unsigned char* simple_alloc(unsigned long long needed_bytes, bool b_free = false)
 	// reallocates only when needed
 	{
 		static unsigned char *buf = nullptr;
 		static unsigned long long bytes = 0;
 
-		if (free)
+		if (b_free)
 		{
 			delete[] buf;
+			buf = nullptr;
 			bytes = 0;
 		}
 
@@ -98,15 +104,16 @@ namespace imgproc
 	}
 
 #ifdef __CUDACC__
-	inline unsigned char* simple_alloc_gpu(unsigned long long needed_bytes, bool free = false)
+	inline unsigned char* simple_alloc_gpu(unsigned long long needed_bytes, bool b_free = false)
 	// reallocates only when needed
 	{
 		static unsigned char *d_buf = nullptr;
 		static unsigned long long bytes = 0;
 
-		if (free)
+		if (b_free)
 		{
 			gpuErrchk(cudaFree(d_buf));
+			d_buf = nullptr;
 			bytes = 0;
 		}
 
@@ -184,14 +191,14 @@ namespace imgproc
 
 	IMGPROC_DEVICE_HOST inline bool niblack_threshold(float I, float m, float d2, float K)
 	{
-		float a = I - m;
-		return a < 0 || a*a < K*K*d2;
+		float a = I - m + IMGPROC_EPS;
+		return a < 0 && a*a > K*K*d2; // assume K < 0
 	}
 	IMGPROC_DEVICE_HOST inline bool sauvola_threshold(float I, float m, float d2, float K)
 	{
 		float a = I + m*(K - 1);
 		float b = m*K;
-		return a < 0 || a*a < 4*b*b*d2;
+		return a < 0 || a*a < 4*b*b*d2; // assume K > 0
 	}
 
 } // namespace imgproc
