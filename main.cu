@@ -30,9 +30,20 @@
 
 */
 
+#include <iostream>
+#include <string>
+#include <chrono>
+#include <type_traits>
+
+#define STB_IMAGE_IMPLEMENTATION
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+
+#include "stb_image.h"
+#include "stb_image_write.h"
+
 #ifdef __CUDACC__
 
-//#define ENABLE_CUDA_GPGPU	// comment this line to use C++ code when compiling with CUDA compiler
+#define ENABLE_CUDA_GPGPU	// comment this line to use C++ code when compiling with CUDA compiler
 							// not needed if you are using GCC
 #endif
 
@@ -44,29 +55,116 @@
 
 #endif
 
-#define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h"
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h"
+/* available functions for thresholding:
+	== CPU ==
+	sauvola
+	niblack
+	bernsen
+	singh
+	sauvola_chan
+	niblack_chan
+	singh_chan
+	global
 
-#include <iostream>
-#include <string>
-#include <chrono>
+	== GPU ==
+	sauvola_gpu
+	sauvola_gpu2
+	niblack_gpu
+	niblack_gpu2
+	bernsen_gpu
+	bernsen_gpu2
+	singh_gpu
+	singh_gpu2
+	singh_gpu3
+	global_gpu
+*/
 
-#define W 13		// window size (must be odd)
-#define R (W/2)		// filter radius
+#define FUNC_TO_TEST bernsen
+#define FUNC_ARGUMENTS , 15, 100
 
-#if W % 2 == 0
-#error Value of W: NO BUONO!
-#endif
+#define IS_GLOBAL 0 // if you want to test global or global_gpu, please set this to 1
+#define IS_SINGH_GPU3 0 // if you want to test singh_gpu3, please set this to 1
 
-void test(unsigned char* raw, unsigned int w, unsigned int h)
+#define TO_STR(...) #__VA_ARGS__
+#define FUNC_STR(...) TO_STR(__VA_ARGS__)
+#define FUNC_NAME FUNC_STR(FUNC_TO_TEST FUNC_ARGUMENTS)
+
+void save_single_image(unsigned char *raw, unsigned int width, unsigned int height, int i, std::string name = std::string("image"))
 {
-#ifdef ENABLE_CUDA_GPGPU
-	imgproc::bernsen_gpu2<R>(raw, w, h);
+	name += '_';
+	name += std::to_string(i);
+	name += ".png";
+	stbi_write_png(name.c_str(), width, height, 1, raw, width);
+}
+
+template <int R = 6>
+void simple_test(unsigned char *raw, unsigned int w, unsigned int h)
+{
+#if defined(ENABLE_CUDA_GPGPU) && IS_GLOBAL == 0 && IS_SINGH_GPU3 == 0
+	imgproc::FUNC_TO_TEST<R>(raw, w, h FUNC_ARGUMENTS);
+#elif IS_SINGH_GPU3 == 0
+	imgproc::FUNC_TO_TEST(raw, w, h, R FUNC_ARGUMENTS);
 #else
-	imgproc::bernsen(raw, w, h, R);
+	imgproc::FUNC_TO_TEST(raw, w, h FUNC_ARGUMENTS);
 #endif
+}
+
+template <int R = 6>
+void prealloc_test(unsigned char *raw, unsigned int w, unsigned int h, int idx)
+{
+	namespace chrono = std::chrono;
+
+	auto begin = chrono::steady_clock::now();
+
+	simple_test<R>(raw, w, h);
+
+	auto end = chrono::steady_clock::now();
+
+	std::cout << "Time elapsed for processing image " << idx << ": "
+			  << chrono::duration_cast<chrono::microseconds>(end - begin).count() * 1.e-6
+			  << " [s]\n";
+
+	save_single_image(raw, w, h, idx, FUNC_NAME);
+
+	begin = chrono::steady_clock::now();
+
+	simple_test<R>(raw, w, h);
+
+	end = chrono::steady_clock::now();
+
+	std::cout << "Time elapsed for processing image " << idx << " with preallocation: "
+			  << chrono::duration_cast<chrono::microseconds>(end - begin).count() * 1.e-6
+			  << " [s]\n";
+}
+
+template <int R = 6>
+void prealloc_test2(unsigned char *raw, unsigned int w, unsigned int h, int idx)
+{
+	namespace chrono = std::chrono;
+
+	simple_test<R>(raw, w, h);
+
+	auto begin = chrono::steady_clock::now();
+
+	simple_test<R>(raw, w, h);
+
+	auto end = chrono::steady_clock::now();
+
+	std::cout << chrono::duration_cast<chrono::microseconds>(end - begin).count() * 1.e-6 << ' ';
+}
+
+template <int R, int Step, int maxR, std::enable_if<(R < 0)>::type* = nullptr>
+void window_test(unsigned char*, unsigned int, unsigned int, int)
+{
+	std::cout << '\n' << FUNC_NAME << ' ';
+}
+
+template <int R = 20, int Step = 2, int maxR = R, std::enable_if<(R >= 0)>::type* = nullptr>
+void window_test(unsigned char *raw, unsigned int w, unsigned int h, int idx)
+{
+	std::cout << '\t' << (maxR % Step + maxR - R)*2+1; // :)
+	window_test<R-Step, Step, maxR>(raw, w, h, idx);
+	prealloc_test2<R>(raw, w, h, idx);
 }
 
 int main(const int narg, const char** args)
@@ -103,7 +201,7 @@ int main(const int narg, const char** args)
 			img_paths[i-1] = std::string(args[i]);
 	}
 
-	for (int i = 0; i < Nimages; ++i)
+	for (unsigned int i = 0; i < Nimages; ++i)
 	{
 		int width, height, ch;
 
@@ -123,30 +221,7 @@ int main(const int narg, const char** args)
 				  << chrono::duration_cast<chrono::microseconds>(end - begin).count() * 1.e-6
 				  << " [s]\n";
 
-		begin = chrono::steady_clock::now();
-
-		test(raw, width, height);
-
-		end = chrono::steady_clock::now();
-
-		std::cout << "Time elapsed for processing image " << i << ": "
-				  << chrono::duration_cast<chrono::microseconds>(end - begin).count() * 1.e-6
-				  << " [s]\n";
-
-		begin = chrono::steady_clock::now();
-
-		test(raw, width, height);
-
-		end = chrono::steady_clock::now();
-
-		std::cout << "Time elapsed for processing image with preallocation " << i << ": "
-				  << chrono::duration_cast<chrono::microseconds>(end - begin).count() * 1.e-6
-				  << " [s]\n";
-
-		std::string out_path("image");
-		out_path += std::to_string(i);
-		out_path += ".png";
-		stbi_write_png(out_path.c_str(), width, height, 1, raw, width);
+		window_test(raw, width, height, i);
 
 		delete[] raw;
 	}
